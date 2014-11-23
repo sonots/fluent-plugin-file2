@@ -7,27 +7,36 @@ module Fluent
     end
 
     config_param :path, :string
-    config_param :time_slice_format, :string, :default => '%Y%m%d'
-    config_param :format, :string, :default => 'out_file'
-    # params of HandleTagAndTimeMixin and TextFormatters are also available
+    config_param :time_slice_format, :string, :default => '%Y%m%d' # for out_file compatibility
+    config_param :format, :string, :default => 'out_file' # params of HandleTagAndTimeMixin and TextFormatters are also available
     config_param :symlink_path, :string, :default => nil
 
-    # SUPPORTED_COMPRESS = {
-    #   'gz' => :gz,
-    #   'gzip' => :gz,
-    # }
-    # config_param :compress, :default => nil do |val|
-    #   c = SUPPORTED_COMPRESS[val]
-    #   unless c
-    #     raise ConfigError, "Unsupported compression algorithm '#{val}'"
-    #   end
-    #   c
-    # end
+    SUPPORTED_COMPRESS = {
+      'gz' => :gz,
+      'gzip' => :gz,
+    }
+    config_param :compress, :default => nil do |val|
+      c = SUPPORTED_COMPRESS[val]
+      unless c
+        raise ConfigError, "Unsupported compression algorithm '#{val}'"
+      end
+      c
+    end
+    config_param :time_slice_wait, :time, :default => nil # for out_file compatibility
+    config_param :compress_wait, :time, :default => 10*60
+    
+    attr_reader :time_slicer, :compress_thread, :compress_interval
+
+    # for test
+    def strftime_path
+      @writer.strftime_path
+    end
 
     def initialize
-      # require 'zlib'
+      require 'zlib'
       require 'fileutils'
       require 'time'
+      require 'thread'
       super
     end
 
@@ -37,6 +46,7 @@ module Fluent
       conf['format'] = @format
       @formatter = TextFormatter.create(conf)
 
+      # configure_path(conf)
       if pos = @path.index('*')
         path_prefix = @path[0,pos]
         path_suffix = @path[pos+1..-1]
@@ -54,6 +64,7 @@ module Fluent
         raise ConfigError, "#{e.class}: #{e.message}"
       end
 
+      # configure_writer(conf)
       if conf['utc']
         @localtime = false
       elsif conf['localtime']
@@ -75,17 +86,39 @@ module Fluent
             Time.at(time).utc.strftime(@time_slice_path)
           }
         end
+      @writer = FileWriter.new(self)
 
-      @writer = StrftimeFileWriter.new(@log, @time_slicer, @symlink_path)
+      # configure_compress(conf)
+      if @compress
+        @compress_wait = @time_slice_wait if @time_slice_wait # for compatibility with out_file
+        @compress_interval =
+          if @time_slice_path.index('%S')
+            1
+          elsif @time_slice_path.index('%M')
+            60
+          elsif @time_slice_path.index('%H')
+            60 * 60
+          elsif @time_slice_path.index('%d')
+            24 * 60 * 60
+          else
+            raise ConfigError, 'path (or time_slice_format) must include %d or %H or %M or %S'
+          end
+        @compress_thread = CompressThread.new(self)
+      end
+
+    end
+
+    def start
+      super
+      @compress_thread.start if @compress_thread
+    end
+
+    def shutdown
+      @compress_thread.shutdown if @compress_thread
     end
 
     def format(tag, time, record)
       @formatter.format(tag, time, record)
-    end
-
-    # for test
-    def strftime_path
-      @writer.strftime_path
     end
 
     def emit(tag, es, chain)
@@ -94,30 +127,86 @@ module Fluent
         @writer.write(msg)
       end
 
-      # case @compress
-      # when nil
-      #   File.open(path, "a", DEFAULT_FILE_PERMISSION) {|f|
-      #     chunk.write_to(f)
-      #   }
-      # when :gz
-      #   File.open(path, "a", DEFAULT_FILE_PERMISSION) {|f|
-      #     gz = Zlib::GzipWriter.new(f)
-      #     chunk.write_to(gz)
-      #     gz.close
-      #   }
-      # end
-
       chain.next
     end
 
-    class StrftimeFileWriter
+    class CompressThread
+      attr_reader :log
+
+      def initialize(output)
+        @log = output.log
+        @output = output
+        @compress = output.compress
+        @compress_wait = output.compress_wait
+        @compress_interval = output.compress_interval
+        @time_slicer = output.time_slicer
+        @sleep = [[@compress_wait, 1].min, 0.1].max
+      end
+
+      def start
+        @running = true
+        @thread = Thread.new(&method(:run))
+      end
+
+      def shutdown
+        @running = false
+        @thread.join
+      end
+
+      def run
+        now = Time.now.to_i
+        wait_until = Time.at(now - (now % @compress_interval) + @compress_interval + @compress_wait)
+        while @running
+          # sleep @interval is bad because it blocks on shutdown
+          while @running && Time.now <= wait_until
+            sleep @sleep
+          end
+          strftime_path = @time_slicer.call((Time.now - @compress_wait).to_i)
+          compress(strftime_path)
+          wait_until += @compress_interval
+        end
+      end
+
+      def compress(path)
+        case @compress
+        when :gz
+          begin
+            file = File.open(path, 'r')
+            create_file("#{path}.gz") do |gz_file|
+              gz = Zlib::GzipWriter.new(gz_file)
+              FileUtils.copy_stream(file, gz)
+              gz.close
+              file.close rescue nil
+              File.unlink(path) rescue nil
+              log.info "gzip #{path} to #{path}.gz. #{path} is removed."
+            end
+          rescue Errno::ENOENT
+            log.info "#{path} is not found. compress skipped."
+          else
+            file.close rescue nil
+          end
+        end
+      end
+
+      def create_file(filename, &block)
+        begin
+          File.open filename, (File::WRONLY | File::APPEND | File::CREAT | File::EXCL), DEFAULT_FILE_PERMISSION, &block
+        rescue Errno::EEXIST
+          log.debug "#{filename} already exists."
+          # do nothing
+        end
+      end
+    end
+
+    class FileWriter
       attr_reader :log
       attr_reader :strftime_path # for test
 
-      def initialize(log, time_slicer, symlink_path)
-        @log = log
-        @time_slicer = time_slicer
-        @symlink_path = symlink_path
+      def initialize(output)
+        @log = output.log
+        @output = output
+        @time_slicer = output.time_slicer
+        @symlink_path = output.symlink_path
         @mutex = Mutex.new
         @strftime_path = nil
         @file = nil
@@ -170,10 +259,12 @@ module Fluent
 
       def create_file(filename)
         begin
-          f = File.open filename, (File::WRONLY | File::APPEND | File::CREAT | File::EXCL)
+          f = File.open filename, (File::WRONLY | File::APPEND | File::CREAT | File::EXCL), DEFAULT_FILE_PERMISSION
           f.sync = true
+          log.info "#{filename} is created."
         rescue Errno::EEXIST
           f = open_file(filename)
+          log.debug "#{filename} already exists."
         end
         f
       end
@@ -184,4 +275,3 @@ module Fluent
     end
   end
 end
-

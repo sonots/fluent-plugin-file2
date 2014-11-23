@@ -55,7 +55,7 @@ class File2OutputTest < Test::Unit::TestCase
     Delorean.time_travel_to  Time.parse("2011-01-02 13:14:15 UTC")
   end
 
-  def treadown
+  def teardown
     Delorean.back_to_the_present
   end
 
@@ -64,7 +64,6 @@ class File2OutputTest < Test::Unit::TestCase
 
   CONFIG = %[
     path #{TMP_DIR}/out_file_test
-    # compress gz
     utc
   ]
 
@@ -83,10 +82,10 @@ class File2OutputTest < Test::Unit::TestCase
   def test_configure
     d = create_driver %[
       path test_path
-      # compress gz
+      compress gz
     ]
     assert_equal 'test_path', d.instance.path
-    # assert_equal :gz, d.instance.compress
+    assert_equal :gz, d.instance.compress
   end
 
   def test_default_localtime
@@ -148,23 +147,23 @@ class File2OutputTest < Test::Unit::TestCase
     end
   end
 
-  # def check_gzipped_result(path, expect)
-  #   # Zlib::GzipReader has a bug of concatenated file: https://bugs.ruby-lang.org/issues/9790
-  #   # Following code from https://www.ruby-forum.com/topic/971591#979520
-  #   result = ''
-  #   File.open(path) { |io|
-  #     loop do
-  #       gzr = Zlib::GzipReader.new(io)
-  #       result << gzr.read
-  #       unused = gzr.unused
-  #       gzr.finish
-  #       break if unused.nil?
-  #       io.pos -= unused.length
-  #     end
-  #   }
+  def check_gzipped_result(path, expect)
+    # Zlib::GzipReader has a bug of concatenated file: https://bugs.ruby-lang.org/issues/9790
+    # Following code from https://www.ruby-forum.com/topic/971591#979520
+    result = ''
+    File.open(path) { |io|
+      loop do
+        gzr = Zlib::GzipReader.new(io)
+        result << gzr.read
+        unused = gzr.unused
+        gzr.finish
+        break if unused.nil?
+        io.pos -= unused.length
+      end
+    }
 
-  #   assert_equal expect, result
-  # end
+    assert_equal expect, result
+  end
 
   def check_result(path, expect)
     assert_equal expect, File.read(path)
@@ -276,5 +275,79 @@ class File2OutputTest < Test::Unit::TestCase
       path = d.run
       assert_equal "#{TMP_DIR}/out_file_test.2011-01-02-13.log", path
     end
+  end
+
+  sub_test_case 'configure (out_file2)' do
+    test 'compress_wait' do
+      # out_file compatibility
+      d = create_driver %[
+        path #{TMP_DIR}/out_file_test.%Y%m%d.log
+        compress gz
+        time_slice_wait 10
+      ]
+      assert_equal 10, d.instance.compress_wait
+
+      d = create_driver %[
+        path #{TMP_DIR}/out_file_test.%Y%m%d%H%M%S.log
+        compress_wait 0.1
+        compress gz
+      ]
+      assert_equal 0.1, d.instance.compress_wait
+    end
+
+    test 'compress_interval' do
+      assert_raise(Fluent::ConfigError) do
+        create_driver %[
+          path #{TMP_DIR}/out_file_test.%Y%m.log
+          compress gz
+        ]
+      end
+
+      d = create_driver %[
+        path #{TMP_DIR}/out_file_test.%Y%m%d.log
+        compress gz
+      ]
+      assert_equal 24 * 60 * 60, d.instance.compress_interval
+
+      d = create_driver %[
+        path #{TMP_DIR}/out_file_test.%Y%m%d%H.log
+        compress gz
+      ]
+      assert_equal 60 * 60, d.instance.compress_interval
+
+      d = create_driver %[
+        path #{TMP_DIR}/out_file_test.%Y%m%d%H%M.log
+        compress gz
+        compress_wait 60
+      ]
+      assert_equal 60, d.instance.compress_interval
+
+      d = create_driver %[
+        path #{TMP_DIR}/out_file_test.%Y%m%d%H%M%S.log
+        compress gz
+        compress_wait 1
+      ]
+      assert_equal 1, d.instance.compress_interval
+    end
+  end
+
+  def test_compress
+    d = create_driver(%[
+      path #{TMP_DIR}/out_file_test.%Y%m%d%H%M%S.log
+      compress gz
+      compress_wait 0.1
+      utc
+    ])
+
+    time = Time.parse("2011-01-02 13:14:15 UTC").to_i
+    d.emit({"a"=>1}, time)
+    d.emit({"a"=>2}, time)
+    path = d.run {
+      10.times { sleep 0.05 }
+    }
+
+    assert_false File.exist?(path)
+    assert_true File.exist?("#{path}.gz")
+    check_gzipped_result("#{path}.gz", %[2011-01-02T13:14:15Z\ttest\t{"a":1}\n] + %[2011-01-02T13:14:15Z\ttest\t{"a":2}\n])
   end
 end
