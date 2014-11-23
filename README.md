@@ -4,10 +4,12 @@
 
 Re-implementation of out\_file plugin for Fluentd.
 
-## Problems
+## Problems of out\_file
 
 1. `out_file` plugin is not thread-safe and process-safe. See http://d.hatena.ne.jp/sfujiwara/20121027/1351330488 (Japanese)
 2. `out_file` plugin creates multiple separated buffer files on running multiple threads (and processes). Want to write into one file cuncurrently from multiple threads (and processes).
+3. Because of 2, `symlink_path` option will be broken under multiple threads (or processes)
+4. Complex (Do we really need the File Buffer before writing file? Both is file!)
 
 ## Strategy
 
@@ -16,10 +18,14 @@ The fundamental strategy to solve above problems is:
 Specify `path` with time format, and just append contents to the strftime filename from multiple threads (and processes). No buffer file is generated anymore.
 This is the same strategy with [strftime_logger](https://github.com/sonots/strftime_logger), which is already running on my production environment.
 
-For compression, compress a previously generate file on another thread in each interval implied by the time format in the `path` parameter. 
-The thread and process safety was achieved by a delicate implementation although I think running another cron job for compression is better approach. 
+For compression, create a thread for compression running in an interval implied by the time format in the `path` (like 1 hour interval for %H) to compress a previously generated file.
+The thread and process safety is achieved by a delicate implementation, just for compatibility with out\_file, although I actually think running another cron job for compression is better approach. 
 
-## How to Use
+## Example
+
+See [example.conf](./example/example.conf)
+
+## Configuration
 
 Basically same with out\_file plugin. You may see the doc of [out_file](http://docs.fluentd.org/articles/out_file). 
 
