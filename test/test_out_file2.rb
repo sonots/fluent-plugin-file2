@@ -343,7 +343,7 @@ class File2OutputTest < Test::Unit::TestCase
     d.emit({"a"=>1}, time)
     d.emit({"a"=>2}, time)
     path = d.run {
-      10.times { sleep 0.05 }
+      12.times { sleep 0.1 }
     }
 
     assert_false File.exist?(path)

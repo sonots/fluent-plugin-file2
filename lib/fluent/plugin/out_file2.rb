@@ -140,7 +140,8 @@ module Fluent
         @compress_wait = output.compress_wait
         @compress_interval = output.compress_interval
         @time_slicer = output.time_slicer
-        @sleep = [[@compress_wait, 1].min, 0.1].max
+        @mutex = Mutex.new
+        @cond = ConditionVariable.new
       end
 
       def start
@@ -150,20 +151,20 @@ module Fluent
 
       def shutdown
         @running = false
+        @cond.signal
         @thread.join
       end
 
       def run
-        now = Time.now.to_i
-        wait_until = Time.at(now - (now % @compress_interval) + @compress_interval + @compress_wait)
-        while @running
-          # sleep @interval is bad because it blocks on shutdown
-          while @running && Time.now <= wait_until
-            sleep @sleep
+        @mutex.synchronize do
+          now = Time.now.to_i
+          wait_sec = @compress_interval + @compress_wait - (now % @compress_interval)
+          @cond.wait(@mutex, wait_sec)
+          while @running
+            strftime_path = @time_slicer.call((Time.now - @compress_interval - @compress_wait).to_i)
+            compress(strftime_path)
+            @cond.wait(@mutex, @compress_interval)
           end
-          strftime_path = @time_slicer.call((Time.now - @compress_wait).to_i)
-          compress(strftime_path)
-          wait_until += @compress_interval
         end
       end
 
