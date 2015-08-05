@@ -43,8 +43,8 @@ module Fluent
     def configure(conf)
       super
 
-      conf['format'] = @format
-      @formatter = TextFormatter.create(conf)
+      @formatter = Plugin.new_formatter(@format)
+      @formatter.configure(conf)
 
       # configure_path(conf)
       if pos = @path.index('*')
